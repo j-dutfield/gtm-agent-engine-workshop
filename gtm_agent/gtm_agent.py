@@ -18,6 +18,7 @@ import json
 import os
 import random
 import uuid
+from typing import Literal
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
@@ -25,6 +26,7 @@ load_dotenv(override=True)
 # Enable LangSmith tracing; project / API key come from the environment or .env.
 os.environ.setdefault("LANGSMITH_TRACING", "true")
 
+from langsmith import Client, configure, tracing_context
 from pydantic import BaseModel
 from langchain.tools import tool, ToolRuntime
 from langchain_openai import ChatOpenAI
@@ -32,8 +34,15 @@ from deepagents import create_deep_agent
 
 from . import data_service
 from .data_service import REP_IDS
+from .privacy import redact_trace_payload, strip_sensitive_fields
 
 MODEL_NAME = "gpt-4o-mini"
+_trace_client = Client(
+    hide_inputs=redact_trace_payload,
+    hide_outputs=redact_trace_payload,
+    hide_metadata=redact_trace_payload,
+)
+configure(client=_trace_client)
 
 # ---------------------------------------------------------------------------
 # Tools
@@ -52,7 +61,7 @@ def build_prospect_profile(prospect_id: str) -> dict:
     "Assemble a full prospect profile (engagement history, account details, tech stack) and store it. Returns the profile and a found flag."
     existing = data_service.get_profile_from_db(prospect_id)["prospect_profile"]
     if existing is not None:
-        return {"prospect_profile": existing, "found": True}
+        return {"prospect_profile": strip_sensitive_fields(existing), "found": True}
     rec = data_service.get_prospect_record(prospect_id)
     if rec is None:
         return {"prospect_profile": None, "found": False}
@@ -63,21 +72,20 @@ def build_prospect_profile(prospect_id: str) -> dict:
         "account_details": data_service.fetch_account_details(prospect_id),
         "tech_stack": data_service.fetch_tech_stack(prospect_id),
     }
+    built = strip_sensitive_fields(built)
     data_service.save_profile_to_db(prospect_id, built)
     return {"prospect_profile": built, "found": True}
 
 
 SCORING_PROMPT = (
     "You are a GTM assistant. Score the prospect's potential for the offering from "
-    "1 to 100 based on how good a fit they are, weighing their annual revenue and "
-    "tech stack. In your justification, explicitly list which of the offering's required "
+    "1 to 100 based on annual revenue, tech stack, and segment fit when segment data "
+    "is available. In your justification, explicitly list which of the offering's required "
     "technologies the prospect has and which required technologies they are missing, naming "
     "each one. Any missing required technology must lower the tech_stack_match component and "
     "the overall score. Return a score and a justification that reflects your "
     "overall assessment of this prospect's potential."
 )
-
-from typing import Literal
 
 class RubricBreakdown(BaseModel):
     revenue_fit: float
@@ -103,18 +111,34 @@ def _offering_has_required_fields(offering):
 
 
 @tool
-def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict:
-    "Score a prospect profile's potential for an offering on a 1-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
-    if offering is None or not _offering_has_required_fields(offering):
+def score_prospect(
+    prospect_id: str,
+    annual_revenue: int,
+    tech_stack: list[str],
+    required_tech_stack: list[str],
+    min_annual_revenue: int,
+    target_segment: str,
+    description: str,
+    prospect_segment: str | None = None,
+) -> dict:
+    "Score using the prospect id, annual revenue, tech stack, optional segment, and offering requirements; pass only these fields from the profile and offering."
+    offering = {
+        "required_tech_stack": required_tech_stack,
+        "min_annual_revenue": min_annual_revenue,
+        "target_segment": target_segment,
+        "description": description,
+    }
+    if not _offering_has_required_fields(offering):
         return {"score": None, "error": "Cannot score without a valid offering."}
-    # Score against the prospect's saved tech stack of record.
-    pid = prospect_profile.get("prospect_id")
-    if pid is not None:
-        prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(pid)}
-    user = (
-        "Offering:\n" + json.dumps(offering, indent=2) +
-        "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2)
-    )
+    scoring_inputs = {
+        "annual_revenue": annual_revenue,
+        "tech_stack": tech_stack,
+        "prospect_segment": prospect_segment,
+        "required_tech_stack": required_tech_stack,
+        "min_annual_revenue": min_annual_revenue,
+        "target_segment": target_segment,
+    }
+    user = json.dumps(scoring_inputs, indent=2)
     result = _scoring_llm.invoke([
         {"role": "system", "content": SCORING_PROMPT},
         {"role": "user", "content": user},
@@ -133,7 +157,7 @@ def get_prospect(prospect_id: str) -> dict:
     contact = {
         "prospect_id": prospect_id,
         **{k: v for k, v in record.items()
-           if k not in ("engagement_history", "account_details", "tech_stack")},
+           if k not in ("engagement_history", "account_details", "tech_stack", "billing_qualification")},
     }
     return {"prospect": contact, "found": True}
 
@@ -231,19 +255,20 @@ def run_agent(user_message, *, user_id=None, environment="production", thread_id
     # Pre-assign the root run id so the caller can attach feedback to this run;
     # the tracing context is not visible to us once invoke() has returned.
     run_id = uuid.uuid4()
-    result = gtm_agent.invoke(
-        {"messages": [{"role": "user", "content": user_message}]},
-        config={
-            "run_name": "GTM Assistant",
-            "run_id": run_id,
-            "metadata": {
-                "thread_id": thread_id,
-                "user_id": user_id,
-                "environment": environment,
-                "request_intent": classify_intent(user_message),
+    with tracing_context(client=_trace_client):
+        result = gtm_agent.invoke(
+            {"messages": [{"role": "user", "content": user_message}]},
+            config={
+                "run_name": "GTM Assistant",
+                "run_id": run_id,
+                "metadata": {
+                    "thread_id": thread_id,
+                    "user_id": user_id,
+                    "environment": environment,
+                    "request_intent": classify_intent(user_message),
+                },
             },
-        },
-    )
+        )
     return {
         "reply": result["messages"][-1].content,
         "messages": result["messages"],

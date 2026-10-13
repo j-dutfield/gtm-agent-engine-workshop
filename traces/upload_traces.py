@@ -15,13 +15,17 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from langsmith import Client, uuid7
 from langsmith.utils import LangSmithNotFoundError
+from gtm_agent.privacy import redact_trace_payload
 
 # Project name comes from .env (LANGSMITH_PROJECT); override with --project.
 DEFAULT_PROJECT = os.getenv("LANGSMITH_PROJECT")
@@ -150,7 +154,7 @@ def main():
         parser.error("No project name found. Set LANGSMITH_PROJECT in .env or pass --project.")
 
     with open(args.input) as f:
-        runs = json.load(f)
+        runs = redact_trace_payload(json.load(f))
 
     print(f"Loaded {len(runs)} runs from {args.input}")
     if not runs:
