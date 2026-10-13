@@ -11,6 +11,7 @@ The underlying records live in ``gtm_records``.
 from langsmith import traceable
 
 from .gtm_records import OFFERINGS, PROSPECTS, REP_IDS
+from .privacy import strip_sensitive_fields
 
 __all__ = [
     "get_offering", "get_prospect_record", "update_prospect_info",
@@ -33,7 +34,8 @@ def get_offering(offering_id):
 
 def get_prospect_record(prospect_id):
     "Return the source prospect record for prospect_id, or None if not found."
-    return PROSPECTS.get(prospect_id)
+    record = PROSPECTS.get(prospect_id)
+    return strip_sensitive_fields(record) if record is not None else None
 
 
 def get_rep(rep):
@@ -60,16 +62,28 @@ def fetch_tech_stack(prospect_id):
     return PROSPECTS[prospect_id]["tech_stack"]
 
 
-@traceable(run_type="tool", name="get_profile_from_db")
+@traceable(
+    run_type="tool",
+    name="get_profile_from_db",
+    process_outputs=strip_sensitive_fields,
+)
 def get_profile_from_db(prospect_id):
     "Look up a stored prospect profile. Returns {'prospect_profile': record|None}."
-    return {"prospect_profile": _PROFILES.get(prospect_id)}
+    profile = _PROFILES.get(prospect_id)
+    if profile is not None:
+        profile = strip_sensitive_fields(profile)
+        _PROFILES[prospect_id] = profile
+    return {"prospect_profile": profile}
 
 
-@traceable(run_type="tool", name="save_profile_to_db")
+@traceable(
+    run_type="tool",
+    name="save_profile_to_db",
+    process_inputs=strip_sensitive_fields,
+)
 def save_profile_to_db(prospect_id, profile):
     "Persist a prospect profile to the profile store."
-    _PROFILES[prospect_id] = profile
+    _PROFILES[prospect_id] = strip_sensitive_fields(profile)
     return {"saved": True}
 
 def update_prospect_info(prospect_id, technology):

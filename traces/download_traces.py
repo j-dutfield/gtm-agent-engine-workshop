@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import uuid
 from collections import defaultdict
 from datetime import datetime
@@ -20,7 +21,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from langsmith import Client
+from gtm_agent.privacy import redact_trace_payload
 
 # Project name comes from .env (LANGSMITH_PROJECT); override with --project.
 DEFAULT_PROJECT = os.getenv("LANGSMITH_PROJECT")
@@ -162,7 +166,7 @@ def main():
 
     # Serialize first, then scrub any local absolute paths out of the whole
     # payload (error tracebacks, inputs, outputs, extra) in one pass.
-    payload = scrub(json.dumps(runs, indent=2, default=serialize))
+    payload = scrub(json.dumps(redact_trace_payload(runs), indent=2, default=serialize))
     with open(args.output, "w") as f:
         f.write(payload)
 
